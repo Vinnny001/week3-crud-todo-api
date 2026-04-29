@@ -8,8 +8,8 @@ app.use(cors());
 const FAVOURITE_ID = 2; // locked category
 
 let categories = [
-  { id: 1, name: 'My Tasks', color: '#6366f1', locked: false },
   { id: FAVOURITE_ID, name: 'Favourite', color: '#f59e0b', locked: true },
+  { id: 1, name: 'My Tasks', color: '#6366f1', locked: false },
 ];
 
 let todos = [
