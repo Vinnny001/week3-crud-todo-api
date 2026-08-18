@@ -989,6 +989,97 @@ app.get("/active", async (req, res) => {
 });
 
 
+
+// DELETE /categories/:id/with-tasks
+app.delete("/categories/:id/with-tasks", async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+        const id = parseInt(req.params.id);
+
+        if (Number.isNaN(id)) {
+            return res.status(400).json({
+                error: "Invalid category ID",
+            });
+        }
+
+        await client.query("BEGIN");
+
+        const categoryResult = await client.query(
+            `
+            SELECT *
+            FROM categories
+            WHERE id = $1
+            `,
+            [id]
+        );
+
+        if (categoryResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                error: "Category not found",
+            });
+        }
+
+        const category = categoryResult.rows[0];
+
+        if (category.locked) {
+            await client.query("ROLLBACK");
+
+            return res.status(403).json({
+                error: "Cannot delete a locked category",
+            });
+        }
+
+        // Delete subtasks belonging to todos in this category
+        await client.query(
+            `
+            DELETE FROM subtasks
+            WHERE todo_id IN (
+                SELECT id FROM todos WHERE category_id = $1
+            )
+            `,
+            [id]
+        );
+
+        // Delete the todos themselves
+        await client.query(
+            `
+            DELETE FROM todos
+            WHERE category_id = $1
+            `,
+            [id]
+        );
+
+        // Delete the category
+        await client.query(
+            `
+            DELETE FROM categories
+            WHERE id = $1
+            `,
+            [id]
+        );
+
+        await client.query("COMMIT");
+
+        res.status(204).send();
+
+    } catch (error) {
+        await client.query("ROLLBACK");
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to delete category and its tasks",
+        });
+
+    } finally {
+        client.release();
+    }
+});
+
+
 // GET /health
 app.get("/health", (req, res) => {
     res.status(200).json({
