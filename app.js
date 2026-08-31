@@ -47,44 +47,87 @@ pool.connect()
 // DATABASE HELPER
 // ============================================================
 
+const TODO_SELECT = `
+    SELECT
+        t.id,
+        t.task,
+        t.completed,
+        t.due_date AS "dueDate",
+        t.category_id AS "categoryId",
+        t.favourited,
+        t.created_at AS "createdAt",
+        t.updated_at AS "updatedAt",
+
+        COALESCE((
+            SELECT json_agg(
+                json_build_object(
+                    'id', s.id,
+                    'task', s.task,
+                    'completed', s.completed
+                )
+                ORDER BY s.id
+            )
+            FROM subtasks s
+            WHERE s.todo_id = t.id
+        ), '[]') AS subtasks,
+
+        COALESCE((
+            SELECT json_agg(
+                json_build_object(
+                    'id', r.id,
+                    'daysBefore', r.days_before,
+                    'message', r.message,
+                    'enabled', r.enabled
+                )
+                ORDER BY r.days_before
+            )
+            FROM task_reminders r
+            WHERE r.todo_id = t.id
+        ), '[]') AS reminders
+
+    FROM todos t
+`;
+
 async function getTodoById(id) {
     const result = await pool.query(
-        `
-        SELECT
-            t.id,
-            t.task,
-            t.completed,
-            t.due_date AS "dueDate",
-            t.category_id AS "categoryId",
-            t.favourited,
-            t.created_at AS "createdAt",
-            t.updated_at AS "updatedAt",
-
-            COALESCE(
-                json_agg(
-                    json_build_object(
-                        'id', s.id,
-                        'task', s.task,
-                        'completed', s.completed
-                    )
-                    ORDER BY s.id
-                ) FILTER (WHERE s.id IS NOT NULL),
-                '[]'
-            ) AS subtasks
-
-        FROM todos t
-
-        LEFT JOIN subtasks s
-            ON s.todo_id = t.id
-
-        WHERE t.id = $1
-
-        GROUP BY t.id
-        `,
+        `${TODO_SELECT} WHERE t.id = $1`,
         [id]
     );
 
     return result.rows[0];
+}
+
+// Auto-creates the default "due today" reminder for a todo, unless the
+// global setting is off or the todo already has reminders (custom or
+// previously auto-created) — keeps this idempotent to call after any
+// insert/update that leaves the todo with a due date.
+async function maybeCreateDefaultReminder(queryable, todoId) {
+    const settingsResult = await queryable.query(
+        `SELECT notify_due_today_enabled FROM app_settings WHERE id = 1`
+    );
+
+    if (!settingsResult.rows[0]?.notify_due_today_enabled) {
+        return;
+    }
+
+    const existing = await queryable.query(
+        `SELECT id FROM task_reminders WHERE todo_id = $1 LIMIT 1`,
+        [todoId]
+    );
+
+    if (existing.rows.length > 0) {
+        return;
+    }
+
+    await queryable.query(
+        `
+        INSERT INTO task_reminders
+            (todo_id, days_before, message, enabled)
+        VALUES
+            ($1, 0, NULL, TRUE)
+        `,
+        [todoId]
+    );
 }
 
 // ============================================================
@@ -110,7 +153,8 @@ app.get("/categories", async (req, res) => {
                 id,
                 name,
                 color,
-                locked
+                locked,
+                updated_at AS "updatedAt"
             FROM categories
             ORDER BY id
         `);
@@ -149,7 +193,8 @@ app.post("/categories", async (req, res) => {
                 id,
                 name,
                 color,
-                locked
+                locked,
+                updated_at AS "updatedAt"
             `,
             [
                 name.trim(),
@@ -209,7 +254,24 @@ app.patch("/categories/:id", async (req, res) => {
             });
         }
 
-        const { name, color } = req.body;
+        const { name, color, expectedUpdatedAt } = req.body;
+
+        if (
+            expectedUpdatedAt &&
+            new Date(category.updated_at).getTime() !==
+                new Date(expectedUpdatedAt).getTime()
+        ) {
+            return res.status(409).json({
+                error: "conflict",
+                server: {
+                    id: category.id,
+                    name: category.name,
+                    color: category.color,
+                    locked: category.locked,
+                    updatedAt: category.updated_at,
+                },
+            });
+        }
 
         const updatedName =
             name !== undefined
@@ -241,7 +303,8 @@ app.patch("/categories/:id", async (req, res) => {
                 id,
                 name,
                 color,
-                locked
+                locked,
+                updated_at AS "updatedAt"
             `,
             [
                 updatedName,
@@ -355,34 +418,7 @@ app.get("/todos", async (req, res) => {
     try {
         const { categoryId } = req.query;
 
-        let query = `
-            SELECT
-                t.id,
-                t.task,
-                t.completed,
-                t.due_date AS "dueDate",
-                t.category_id AS "categoryId",
-                t.favourited,
-                t.created_at AS "createdAt",
-                t.updated_at AS "updatedAt",
-
-                COALESCE(
-                    json_agg(
-                        json_build_object(
-                            'id', s.id,
-                            'task', s.task,
-                            'completed', s.completed
-                        )
-                        ORDER BY s.id
-                    ) FILTER (WHERE s.id IS NOT NULL),
-                    '[]'
-                ) AS subtasks
-
-            FROM todos t
-
-            LEFT JOIN subtasks s
-                ON s.todo_id = t.id
-        `;
+        let query = TODO_SELECT;
 
         const values = [];
 
@@ -406,7 +442,6 @@ app.get("/todos", async (req, res) => {
         }
 
         query += `
-            GROUP BY t.id
             ORDER BY t.id
         `;
 
@@ -518,9 +553,13 @@ app.post("/todos", async (req, res) => {
             ]
         );
 
-        const newTodo = await getTodoById(
-            result.rows[0].id
-        );
+        const newTodoId = result.rows[0].id;
+
+        if (dueDate) {
+            await maybeCreateDefaultReminder(pool, newTodoId);
+        }
+
+        const newTodo = await getTodoById(newTodoId);
 
         res.status(201).json(newTodo);
 
@@ -568,7 +607,21 @@ app.patch("/todos/:id", async (req, res) => {
             dueDate,
             categoryId,
             favourited,
+            expectedUpdatedAt,
         } = req.body;
+
+        if (
+            expectedUpdatedAt &&
+            new Date(todo.updated_at).getTime() !==
+                new Date(expectedUpdatedAt).getTime()
+        ) {
+            const currentTodo = await getTodoById(id);
+
+            return res.status(409).json({
+                error: "conflict",
+                server: currentTodo,
+            });
+        }
 
         let newCategoryId = todo.category_id;
 
@@ -636,6 +689,13 @@ app.patch("/todos/:id", async (req, res) => {
                 id,
             ]
         );
+
+        const finalDueDate =
+            dueDate !== undefined ? dueDate : todo.due_date;
+
+        if (finalDueDate) {
+            await maybeCreateDefaultReminder(pool, result.rows[0].id);
+        }
 
         const updatedTodo = await getTodoById(
             result.rows[0].id
@@ -897,35 +957,8 @@ app.delete(
 app.get("/completed", async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT
-                t.id,
-                t.task,
-                t.completed,
-                t.due_date AS "dueDate",
-                t.category_id AS "categoryId",
-                t.favourited,
-
-                COALESCE(
-                    json_agg(
-                        json_build_object(
-                            'id', s.id,
-                            'task', s.task,
-                            'completed', s.completed
-                        )
-                        ORDER BY s.id
-                    ) FILTER (WHERE s.id IS NOT NULL),
-                    '[]'
-                ) AS subtasks
-
-            FROM todos t
-
-            LEFT JOIN subtasks s
-                ON s.todo_id = t.id
-
+            ${TODO_SELECT}
             WHERE t.completed = TRUE
-
-            GROUP BY t.id
-
             ORDER BY t.id
         `);
 
@@ -945,35 +978,8 @@ app.get("/completed", async (req, res) => {
 app.get("/active", async (req, res) => {
     try {
         const result = await pool.query(`
-            SELECT
-                t.id,
-                t.task,
-                t.completed,
-                t.due_date AS "dueDate",
-                t.category_id AS "categoryId",
-                t.favourited,
-
-                COALESCE(
-                    json_agg(
-                        json_build_object(
-                            'id', s.id,
-                            'task', s.task,
-                            'completed', s.completed
-                        )
-                        ORDER BY s.id
-                    ) FILTER (WHERE s.id IS NOT NULL),
-                    '[]'
-                ) AS subtasks
-
-            FROM todos t
-
-            LEFT JOIN subtasks s
-                ON s.todo_id = t.id
-
+            ${TODO_SELECT}
             WHERE t.completed = FALSE
-
-            GROUP BY t.id
-
             ORDER BY t.id
         `);
 
@@ -1076,6 +1082,218 @@ app.delete("/categories/:id/with-tasks", async (req, res) => {
 
     } finally {
         client.release();
+    }
+});
+
+
+// ============================================================
+// REMINDERS
+// ============================================================
+
+// POST /todos/:id/reminders
+app.post("/todos/:id/reminders", async (req, res) => {
+    try {
+        const todoId = parseInt(req.params.id);
+        const { daysBefore, message } = req.body;
+
+        const todoResult = await pool.query(
+            `SELECT id, due_date FROM todos WHERE id = $1`,
+            [todoId]
+        );
+
+        if (todoResult.rows.length === 0) {
+            return res.status(404).json({
+                message: "Todo not found",
+            });
+        }
+
+        if (!todoResult.rows[0].due_date) {
+            return res.status(400).json({
+                error: "Task must have a due date to add a reminder",
+            });
+        }
+
+        const days = parseInt(daysBefore);
+
+        if (Number.isNaN(days) || days < 0) {
+            return res.status(400).json({
+                error: "daysBefore must be a non-negative number",
+            });
+        }
+
+        await pool.query(
+            `
+            INSERT INTO task_reminders
+                (todo_id, days_before, message, enabled)
+            VALUES
+                ($1, $2, $3, TRUE)
+            `,
+            [todoId, days, message?.trim() || null]
+        );
+
+        const updatedTodo = await getTodoById(todoId);
+
+        res.status(201).json(updatedTodo);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to create reminder",
+        });
+    }
+});
+
+
+// PATCH /todos/:id/reminders/:reminderId
+app.patch("/todos/:id/reminders/:reminderId", async (req, res) => {
+    try {
+        const todoId = parseInt(req.params.id);
+        const reminderId = parseInt(req.params.reminderId);
+        const { daysBefore, message, enabled } = req.body;
+
+        const result = await pool.query(
+            `
+            UPDATE task_reminders
+
+            SET
+                days_before = COALESCE($1, days_before),
+                message = CASE WHEN $2 IS NOT NULL THEN $2 ELSE message END,
+                enabled = COALESCE($3, enabled)
+
+            WHERE id = $4
+            AND todo_id = $5
+
+            RETURNING id
+            `,
+            [
+                daysBefore !== undefined ? parseInt(daysBefore) : null,
+                message !== undefined ? (message.trim() || null) : null,
+                enabled !== undefined ? enabled : null,
+                reminderId,
+                todoId,
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                message: "Reminder not found",
+            });
+        }
+
+        const updatedTodo = await getTodoById(todoId);
+
+        res.status(200).json(updatedTodo);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to update reminder",
+        });
+    }
+});
+
+
+// DELETE /todos/:id/reminders/:reminderId
+app.delete("/todos/:id/reminders/:reminderId", async (req, res) => {
+    try {
+        const todoId = parseInt(req.params.id);
+        const reminderId = parseInt(req.params.reminderId);
+
+        const result = await pool.query(
+            `
+            DELETE FROM task_reminders
+            WHERE id = $1
+            AND todo_id = $2
+            RETURNING id
+            `,
+            [reminderId, todoId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: "Reminder not found",
+            });
+        }
+
+        const updatedTodo = await getTodoById(todoId);
+
+        res.status(200).json(updatedTodo);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to delete reminder",
+        });
+    }
+});
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+// GET /settings
+app.get("/settings", async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                notify_due_today_enabled AS "notifyDueTodayEnabled",
+                default_reminder_message AS "defaultReminderMessage",
+                updated_at AS "updatedAt"
+            FROM app_settings
+            WHERE id = 1
+        `);
+
+        res.status(200).json(result.rows[0]);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to fetch settings",
+        });
+    }
+});
+
+
+// PATCH /settings
+app.patch("/settings", async (req, res) => {
+    try {
+        const { notifyDueTodayEnabled, defaultReminderMessage } = req.body;
+
+        const result = await pool.query(
+            `
+            UPDATE app_settings
+
+            SET
+                notify_due_today_enabled = COALESCE($1, notify_due_today_enabled),
+                default_reminder_message = COALESCE($2, default_reminder_message)
+
+            WHERE id = 1
+
+            RETURNING
+                notify_due_today_enabled AS "notifyDueTodayEnabled",
+                default_reminder_message AS "defaultReminderMessage",
+                updated_at AS "updatedAt"
+            `,
+            [
+                notifyDueTodayEnabled !== undefined ? notifyDueTodayEnabled : null,
+                defaultReminderMessage !== undefined
+                    ? defaultReminderMessage.trim()
+                    : null,
+            ]
+        );
+
+        res.status(200).json(result.rows[0]);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to update settings",
+        });
     }
 });
 
