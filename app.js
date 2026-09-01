@@ -254,22 +254,24 @@ app.patch("/categories/:id", async (req, res) => {
             });
         }
 
-        const { name, color, expectedUpdatedAt } = req.body;
+        const { name, color, clientEditedAt } = req.body;
 
+        // Last-write-wins by real event time: if this edit was made (on the
+        // client) before the server's last recorded change, something newer
+        // already won — silently keep the server's version instead of
+        // overwriting it. No user-facing conflict; the client just adopts
+        // whatever comes back.
         if (
-            expectedUpdatedAt &&
-            new Date(category.updated_at).getTime() !==
-                new Date(expectedUpdatedAt).getTime()
+            clientEditedAt &&
+            new Date(clientEditedAt).getTime() <=
+                new Date(category.updated_at).getTime()
         ) {
-            return res.status(409).json({
-                error: "conflict",
-                server: {
-                    id: category.id,
-                    name: category.name,
-                    color: category.color,
-                    locked: category.locked,
-                    updatedAt: category.updated_at,
-                },
+            return res.status(200).json({
+                id: category.id,
+                name: category.name,
+                color: category.color,
+                locked: category.locked,
+                updatedAt: category.updated_at,
             });
         }
 
@@ -497,6 +499,8 @@ app.post("/todos", async (req, res) => {
             task,
             dueDate,
             categoryId,
+            reminderDaysBefore,
+            reminderMessage,
         } = req.body;
 
         if (!task || !task.trim()) {
@@ -556,6 +560,21 @@ app.post("/todos", async (req, res) => {
         const newTodoId = result.rows[0].id;
 
         if (dueDate) {
+            const days = parseInt(reminderDaysBefore);
+
+            if (!Number.isNaN(days) && days >= 0) {
+                await pool.query(
+                    `
+                    INSERT INTO task_reminders
+                        (todo_id, days_before, message, enabled)
+                    VALUES
+                        ($1, $2, $3, TRUE)
+                    `,
+                    [newTodoId, days, reminderMessage?.trim() || null]
+                );
+            }
+
+            // no-ops if a reminder already exists (e.g. the one just above)
             await maybeCreateDefaultReminder(pool, newTodoId);
         }
 
@@ -607,20 +626,19 @@ app.patch("/todos/:id", async (req, res) => {
             dueDate,
             categoryId,
             favourited,
-            expectedUpdatedAt,
+            clientEditedAt,
         } = req.body;
 
+        // Last-write-wins by real event time (see the matching comment in
+        // PATCH /categories/:id) — stale edits are dropped silently and the
+        // caller just receives (and adopts) the current server state.
         if (
-            expectedUpdatedAt &&
-            new Date(todo.updated_at).getTime() !==
-                new Date(expectedUpdatedAt).getTime()
+            clientEditedAt &&
+            new Date(clientEditedAt).getTime() <=
+                new Date(todo.updated_at).getTime()
         ) {
             const currentTodo = await getTodoById(id);
-
-            return res.status(409).json({
-                error: "conflict",
-                server: currentTodo,
-            });
+            return res.status(200).json(currentTodo);
         }
 
         let newCategoryId = todo.category_id;
