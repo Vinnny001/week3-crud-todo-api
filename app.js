@@ -21,6 +21,7 @@ const MAIL_FROM = process.env.MAIL_FROM;
 const CODE_TTL_MINUTES = 15;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TIME_OF_DAY_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 // ============================================================
 // MIDDLEWARE
@@ -86,6 +87,7 @@ const TODO_SELECT = `
                     'id', r.id,
                     'daysBefore', r.days_before,
                     'remindAt', r.remind_at,
+                    'timeOfDay', r.time_of_day,
                     'message', r.message,
                     'enabled', r.enabled
                 )
@@ -855,7 +857,7 @@ app.patch("/auth/change-password", authenticateToken, async (req, res) => {
 
 // Everything below this line belongs to the caller's own account.
 app.use(
-    ["/categories", "/todos", "/completed", "/active", "/settings"],
+    ["/categories", "/todos", "/completed", "/active", "/settings", "/routines"],
     authenticateToken
 );
 
@@ -1899,7 +1901,13 @@ app.delete("/categories/:id/with-tasks", async (req, res) => {
 app.post("/todos/:id/reminders", async (req, res) => {
     try {
         const todoId = parseInt(req.params.id);
-        const { daysBefore, remindAt, message } = req.body;
+        const { daysBefore, remindAt, timeOfDay, message } = req.body;
+
+        if (timeOfDay !== undefined && timeOfDay !== null && !TIME_OF_DAY_RE.test(timeOfDay)) {
+            return res.status(400).json({
+                error: "timeOfDay must be in HH:MM format",
+            });
+        }
 
         const todoResult = await pool.query(
             `SELECT id, due_date FROM todos WHERE id = $1 AND user_id = $2`,
@@ -1951,11 +1959,11 @@ app.post("/todos/:id/reminders", async (req, res) => {
             await pool.query(
                 `
                 INSERT INTO task_reminders
-                    (todo_id, days_before, message, enabled)
+                    (todo_id, days_before, time_of_day, message, enabled)
                 VALUES
-                    ($1, $2, $3, TRUE)
+                    ($1, $2, $3, $4, TRUE)
                 `,
-                [todoId, days, message?.trim() || null]
+                [todoId, days, timeOfDay || null, message?.trim() || null]
             );
         }
 
@@ -1978,7 +1986,13 @@ app.patch("/todos/:id/reminders/:reminderId", async (req, res) => {
     try {
         const todoId = parseInt(req.params.id);
         const reminderId = parseInt(req.params.reminderId);
-        const { daysBefore, remindAt, message, enabled } = req.body;
+        const { daysBefore, remindAt, timeOfDay, message, enabled } = req.body;
+
+        if (timeOfDay !== undefined && timeOfDay !== null && !TIME_OF_DAY_RE.test(timeOfDay)) {
+            return res.status(400).json({
+                error: "timeOfDay must be in HH:MM format",
+            });
+        }
 
         const result = await pool.query(
             `
@@ -1987,21 +2001,23 @@ app.patch("/todos/:id/reminders/:reminderId", async (req, res) => {
             SET
                 days_before = COALESCE($1, r.days_before),
                 remind_at = COALESCE($2, r.remind_at),
-                message = CASE WHEN $3 IS NOT NULL THEN $3 ELSE r.message END,
-                enabled = COALESCE($4, r.enabled)
+                time_of_day = COALESCE($3, r.time_of_day),
+                message = CASE WHEN $4 IS NOT NULL THEN $4 ELSE r.message END,
+                enabled = COALESCE($5, r.enabled)
 
             FROM todos t
 
-            WHERE r.id = $5
-            AND r.todo_id = $6
+            WHERE r.id = $6
+            AND r.todo_id = $7
             AND t.id = r.todo_id
-            AND t.user_id = $7
+            AND t.user_id = $8
 
             RETURNING r.id
             `,
             [
                 daysBefore !== undefined ? parseInt(daysBefore) : null,
                 remindAt ? new Date(remindAt).toISOString() : null,
+                timeOfDay || null,
                 message !== undefined ? (message.trim() || null) : null,
                 enabled !== undefined ? enabled : null,
                 reminderId,
@@ -2058,6 +2074,580 @@ app.delete("/todos/:id/reminders/:reminderId", async (req, res) => {
         const updatedTodo = await getTodoById(todoId, req.user.id);
 
         res.status(200).json(updatedTodo);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to delete reminder",
+        });
+    }
+});
+
+// ============================================================
+// ROUTINES
+// ============================================================
+//
+// A routine has no fixed due date — its deadline is whichever matching date
+// ("occurrence") is soonest, computed client-side from today's date and the
+// recurrence rule (days_of_week or days_of_month), then automatically
+// rolling forward once that date passes. The server just stores the rule,
+// the reminders, and which specific occurrence dates were completed
+// (routine_completions) — it never computes "today" itself, since that has
+// to be evaluated in the caller's own timezone, exactly like due-date-based
+// reminders already are.
+
+const ROUTINE_SELECT = `
+    SELECT
+        rt.id,
+        rt.task,
+        rt.category_id AS "categoryId",
+        rt.recurrence_type AS "recurrenceType",
+        rt.days_of_week AS "daysOfWeek",
+        rt.days_of_month AS "daysOfMonth",
+        rt.favourited,
+        rt.created_at AS "createdAt",
+        rt.updated_at AS "updatedAt",
+
+        COALESCE((
+            SELECT json_agg(
+                json_build_object(
+                    'id', r.id,
+                    'daysBefore', r.days_before,
+                    'remindAt', r.remind_at,
+                    'timeOfDay', r.time_of_day,
+                    'message', r.message,
+                    'enabled', r.enabled
+                )
+                ORDER BY r.days_before NULLS LAST, r.remind_at
+            )
+            FROM routine_reminders r
+            WHERE r.routine_id = rt.id
+        ), '[]') AS reminders,
+
+        COALESCE((
+            SELECT json_agg(to_char(c.occurrence_date, 'YYYY-MM-DD') ORDER BY c.occurrence_date)
+            FROM routine_completions c
+            WHERE c.routine_id = rt.id
+        ), '[]') AS "completedDates"
+
+    FROM routines rt
+`;
+
+async function getRoutineById(id, userId) {
+    const result = await pool.query(
+        `${ROUTINE_SELECT} WHERE rt.id = $1 AND rt.user_id = $2`,
+        [id, userId]
+    );
+
+    return result.rows[0];
+}
+
+// GET /routines
+app.get("/routines", async (req, res) => {
+    try {
+        const { categoryId } = req.query;
+
+        let query = `${ROUTINE_SELECT} WHERE rt.user_id = $1`;
+        const values = [req.user.id];
+
+        if (categoryId) {
+            query += ` AND rt.category_id = $2`;
+            values.push(parseInt(categoryId));
+        }
+
+        query += ` ORDER BY rt.id`;
+
+        const result = await pool.query(query, values);
+
+        res.status(200).json(result.rows);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to fetch routines",
+        });
+    }
+});
+
+
+// POST /routines
+app.post("/routines", async (req, res) => {
+    try {
+        const { task, categoryId, recurrenceType, daysOfWeek, daysOfMonth } = req.body;
+
+        if (!task || !task.trim()) {
+            return res.status(400).json({
+                error: "Task field is required",
+            });
+        }
+
+        if (!["weekly", "monthly"].includes(recurrenceType)) {
+            return res.status(400).json({
+                error: "recurrenceType must be 'weekly' or 'monthly'",
+            });
+        }
+
+        let normalizedDaysOfWeek = null;
+        let normalizedDaysOfMonth = null;
+
+        if (recurrenceType === "weekly") {
+            if (!Array.isArray(daysOfWeek) || daysOfWeek.length === 0) {
+                return res.status(400).json({
+                    error: "daysOfWeek must be a non-empty array (0=Sunday..6=Saturday)",
+                });
+            }
+
+            normalizedDaysOfWeek = daysOfWeek.map((d) => parseInt(d));
+
+            if (normalizedDaysOfWeek.some((d) => Number.isNaN(d) || d < 0 || d > 6)) {
+                return res.status(400).json({
+                    error: "daysOfWeek values must be between 0 and 6",
+                });
+            }
+        } else {
+            if (!Array.isArray(daysOfMonth) || daysOfMonth.length === 0) {
+                return res.status(400).json({
+                    error: "daysOfMonth must be a non-empty array (1-31)",
+                });
+            }
+
+            normalizedDaysOfMonth = daysOfMonth.map((d) => parseInt(d));
+
+            if (normalizedDaysOfMonth.some((d) => Number.isNaN(d) || d < 1 || d > 31)) {
+                return res.status(400).json({
+                    error: "daysOfMonth values must be between 1 and 31",
+                });
+            }
+        }
+
+        const catId = categoryId ? parseInt(categoryId) : null;
+
+        if (!catId) {
+            return res.status(400).json({
+                error: "categoryId is required",
+            });
+        }
+
+        const categoryResult = await pool.query(
+            `SELECT kind FROM categories WHERE id = $1 AND user_id = $2`,
+            [catId, req.user.id]
+        );
+
+        if (categoryResult.rows.length === 0) {
+            return res.status(400).json({
+                error: "Category not found",
+            });
+        }
+
+        if (categoryResult.rows[0].kind === "favourite") {
+            return res.status(403).json({
+                error: "Cannot add routines directly to Favourite",
+            });
+        }
+
+        const result = await pool.query(
+            `
+            INSERT INTO routines
+                (task, category_id, recurrence_type, days_of_week, days_of_month, user_id)
+            VALUES
+                ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            `,
+            [
+                task.trim(),
+                catId,
+                recurrenceType,
+                normalizedDaysOfWeek,
+                normalizedDaysOfMonth,
+                req.user.id,
+            ]
+        );
+
+        const newRoutine = await getRoutineById(result.rows[0].id, req.user.id);
+
+        res.status(201).json(newRoutine);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to create routine",
+        });
+    }
+});
+
+
+// PATCH /routines/:id
+app.patch("/routines/:id", async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+
+        if (Number.isNaN(id)) {
+            return res.status(400).json({
+                error: "Invalid routine ID",
+            });
+        }
+
+        const existing = await pool.query(
+            `SELECT * FROM routines WHERE id = $1 AND user_id = $2`,
+            [id, req.user.id]
+        );
+
+        if (existing.rows.length === 0) {
+            return res.status(404).json({
+                message: "Routine not found",
+            });
+        }
+
+        const routine = existing.rows[0];
+        const { task, categoryId, favourited } = req.body;
+
+        let newCategoryId = routine.category_id;
+
+        if (categoryId !== undefined) {
+            const catId = parseInt(categoryId);
+
+            const categoryResult = await pool.query(
+                `SELECT kind FROM categories WHERE id = $1 AND user_id = $2`,
+                [catId, req.user.id]
+            );
+
+            if (categoryResult.rows.length === 0) {
+                return res.status(400).json({
+                    error: "Category not found",
+                });
+            }
+
+            if (categoryResult.rows[0].kind === "favourite") {
+                return res.status(403).json({
+                    error: "Cannot move a routine to Favourite via categoryId",
+                });
+            }
+
+            newCategoryId = catId;
+        }
+
+        await pool.query(
+            `
+            UPDATE routines
+            SET
+                task = $1,
+                category_id = $2,
+                favourited = $3
+            WHERE id = $4 AND user_id = $5
+            `,
+            [
+                task !== undefined ? task.trim() : routine.task,
+                newCategoryId,
+                favourited !== undefined ? favourited : routine.favourited,
+                id,
+                req.user.id,
+            ]
+        );
+
+        const updated = await getRoutineById(id, req.user.id);
+
+        res.status(200).json(updated);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to update routine",
+        });
+    }
+});
+
+
+// DELETE /routines/:id
+app.delete("/routines/:id", async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+
+        const result = await pool.query(
+            `DELETE FROM routines WHERE id = $1 AND user_id = $2 RETURNING id`,
+            [id, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: "Routine not found",
+            });
+        }
+
+        res.status(204).send();
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to delete routine",
+        });
+    }
+});
+
+
+// POST /routines/:id/complete
+app.post("/routines/:id/complete", async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const { occurrenceDate } = req.body;
+
+        if (!occurrenceDate || !/^\d{4}-\d{2}-\d{2}$/.test(occurrenceDate)) {
+            return res.status(400).json({
+                error: "occurrenceDate must be in YYYY-MM-DD format",
+            });
+        }
+
+        const routineResult = await pool.query(
+            `SELECT id FROM routines WHERE id = $1 AND user_id = $2`,
+            [id, req.user.id]
+        );
+
+        if (routineResult.rows.length === 0) {
+            return res.status(404).json({
+                message: "Routine not found",
+            });
+        }
+
+        await pool.query(
+            `
+            INSERT INTO routine_completions (routine_id, occurrence_date)
+            VALUES ($1, $2)
+            ON CONFLICT (routine_id, occurrence_date) DO NOTHING
+            `,
+            [id, occurrenceDate]
+        );
+
+        const updated = await getRoutineById(id, req.user.id);
+
+        res.status(200).json(updated);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to mark routine complete",
+        });
+    }
+});
+
+
+// DELETE /routines/:id/complete
+app.delete("/routines/:id/complete", async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const { occurrenceDate } = req.body;
+
+        if (!occurrenceDate || !/^\d{4}-\d{2}-\d{2}$/.test(occurrenceDate)) {
+            return res.status(400).json({
+                error: "occurrenceDate must be in YYYY-MM-DD format",
+            });
+        }
+
+        const routineResult = await pool.query(
+            `SELECT id FROM routines WHERE id = $1 AND user_id = $2`,
+            [id, req.user.id]
+        );
+
+        if (routineResult.rows.length === 0) {
+            return res.status(404).json({
+                message: "Routine not found",
+            });
+        }
+
+        await pool.query(
+            `
+            DELETE FROM routine_completions
+            WHERE routine_id = $1 AND occurrence_date = $2
+            `,
+            [id, occurrenceDate]
+        );
+
+        const updated = await getRoutineById(id, req.user.id);
+
+        res.status(200).json(updated);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to undo routine completion",
+        });
+    }
+});
+
+
+// POST /routines/:id/reminders
+app.post("/routines/:id/reminders", async (req, res) => {
+    try {
+        const routineId = parseInt(req.params.id);
+        const { daysBefore, remindAt, timeOfDay, message } = req.body;
+
+        if (timeOfDay !== undefined && timeOfDay !== null && !TIME_OF_DAY_RE.test(timeOfDay)) {
+            return res.status(400).json({
+                error: "timeOfDay must be in HH:MM format",
+            });
+        }
+
+        const routineResult = await pool.query(
+            `SELECT id FROM routines WHERE id = $1 AND user_id = $2`,
+            [routineId, req.user.id]
+        );
+
+        if (routineResult.rows.length === 0) {
+            return res.status(404).json({
+                message: "Routine not found",
+            });
+        }
+
+        if (remindAt) {
+            const when = new Date(remindAt);
+
+            if (Number.isNaN(when.getTime())) {
+                return res.status(400).json({
+                    error: "remindAt must be a valid date/time",
+                });
+            }
+
+            await pool.query(
+                `
+                INSERT INTO routine_reminders
+                    (routine_id, remind_at, message, enabled)
+                VALUES
+                    ($1, $2, $3, TRUE)
+                `,
+                [routineId, when.toISOString(), message?.trim() || null]
+            );
+        } else {
+            const days = parseInt(daysBefore);
+
+            if (Number.isNaN(days) || days < 0) {
+                return res.status(400).json({
+                    error: "daysBefore must be a non-negative number",
+                });
+            }
+
+            await pool.query(
+                `
+                INSERT INTO routine_reminders
+                    (routine_id, days_before, time_of_day, message, enabled)
+                VALUES
+                    ($1, $2, $3, $4, TRUE)
+                `,
+                [routineId, days, timeOfDay || null, message?.trim() || null]
+            );
+        }
+
+        const updated = await getRoutineById(routineId, req.user.id);
+
+        res.status(201).json(updated);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to create reminder",
+        });
+    }
+});
+
+
+// PATCH /routines/:id/reminders/:reminderId
+app.patch("/routines/:id/reminders/:reminderId", async (req, res) => {
+    try {
+        const routineId = parseInt(req.params.id);
+        const reminderId = parseInt(req.params.reminderId);
+        const { daysBefore, remindAt, timeOfDay, message, enabled } = req.body;
+
+        if (timeOfDay !== undefined && timeOfDay !== null && !TIME_OF_DAY_RE.test(timeOfDay)) {
+            return res.status(400).json({
+                error: "timeOfDay must be in HH:MM format",
+            });
+        }
+
+        const result = await pool.query(
+            `
+            UPDATE routine_reminders r
+
+            SET
+                days_before = COALESCE($1, r.days_before),
+                remind_at = COALESCE($2, r.remind_at),
+                time_of_day = COALESCE($3, r.time_of_day),
+                message = CASE WHEN $4 IS NOT NULL THEN $4 ELSE r.message END,
+                enabled = COALESCE($5, r.enabled)
+
+            FROM routines rt
+
+            WHERE r.id = $6
+            AND r.routine_id = $7
+            AND rt.id = r.routine_id
+            AND rt.user_id = $8
+
+            RETURNING r.id
+            `,
+            [
+                daysBefore !== undefined ? parseInt(daysBefore) : null,
+                remindAt ? new Date(remindAt).toISOString() : null,
+                timeOfDay || null,
+                message !== undefined ? (message.trim() || null) : null,
+                enabled !== undefined ? enabled : null,
+                reminderId,
+                routineId,
+                req.user.id,
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                message: "Reminder not found",
+            });
+        }
+
+        const updated = await getRoutineById(routineId, req.user.id);
+
+        res.status(200).json(updated);
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Failed to update reminder",
+        });
+    }
+});
+
+
+// DELETE /routines/:id/reminders/:reminderId
+app.delete("/routines/:id/reminders/:reminderId", async (req, res) => {
+    try {
+        const routineId = parseInt(req.params.id);
+        const reminderId = parseInt(req.params.reminderId);
+
+        const result = await pool.query(
+            `
+            DELETE FROM routine_reminders r
+            USING routines rt
+            WHERE r.id = $1
+            AND r.routine_id = $2
+            AND rt.id = r.routine_id
+            AND rt.user_id = $3
+            RETURNING r.id
+            `,
+            [reminderId, routineId, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                error: "Reminder not found",
+            });
+        }
+
+        const updated = await getRoutineById(routineId, req.user.id);
+
+        res.status(200).json(updated);
 
     } catch (error) {
         console.error(error);
