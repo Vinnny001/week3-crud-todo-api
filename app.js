@@ -85,10 +85,11 @@ const TODO_SELECT = `
                 json_build_object(
                     'id', r.id,
                     'daysBefore', r.days_before,
+                    'remindAt', r.remind_at,
                     'message', r.message,
                     'enabled', r.enabled
                 )
-                ORDER BY r.days_before
+                ORDER BY r.days_before NULLS LAST, r.remind_at
             )
             FROM task_reminders r
             WHERE r.todo_id = t.id
@@ -290,7 +291,7 @@ async function ensureDefaultCategoriesAndSettings(client, userId) {
 
         const t = template.rows[0] || {
             notify_due_today_enabled: true,
-            default_reminder_message: 'Task "{task}" is due today!',
+            default_reminder_message: 'Task "{task}" is due {when}!',
         };
 
         await client.query(
@@ -1242,6 +1243,7 @@ app.post("/todos", async (req, res) => {
             dueDate,
             categoryId,
             reminderDaysBefore,
+            reminderRemindAt,
             reminderMessage,
         } = req.body;
 
@@ -1307,7 +1309,23 @@ app.post("/todos", async (req, res) => {
 
         const newTodoId = result.rows[0].id;
 
-        if (dueDate) {
+        // Custom date & time reminders don't need a due date at all — the
+        // "days before" method (below) is the only one that does.
+        if (reminderRemindAt) {
+            const when = new Date(reminderRemindAt);
+
+            if (!Number.isNaN(when.getTime())) {
+                await pool.query(
+                    `
+                    INSERT INTO task_reminders
+                        (todo_id, remind_at, message, enabled)
+                    VALUES
+                        ($1, $2, $3, TRUE)
+                    `,
+                    [newTodoId, when.toISOString(), reminderMessage?.trim() || null]
+                );
+            }
+        } else if (dueDate) {
             const days = parseInt(reminderDaysBefore);
 
             if (!Number.isNaN(days) && days >= 0) {
@@ -1321,8 +1339,10 @@ app.post("/todos", async (req, res) => {
                     [newTodoId, days, reminderMessage?.trim() || null]
                 );
             }
+        }
 
-            // no-ops if a reminder already exists (e.g. the one just above)
+        if (dueDate) {
+            // no-ops if a reminder already exists (e.g. one just added above)
             await maybeCreateDefaultReminder(pool, newTodoId, req.user.id);
         }
 
@@ -1879,7 +1899,7 @@ app.delete("/categories/:id/with-tasks", async (req, res) => {
 app.post("/todos/:id/reminders", async (req, res) => {
     try {
         const todoId = parseInt(req.params.id);
-        const { daysBefore, message } = req.body;
+        const { daysBefore, remindAt, message } = req.body;
 
         const todoResult = await pool.query(
             `SELECT id, due_date FROM todos WHERE id = $1 AND user_id = $2`,
@@ -1892,29 +1912,52 @@ app.post("/todos/:id/reminders", async (req, res) => {
             });
         }
 
-        if (!todoResult.rows[0].due_date) {
-            return res.status(400).json({
-                error: "Task must have a due date to add a reminder",
-            });
+        // Custom date & time reminders work with or without a due date.
+        if (remindAt) {
+            const when = new Date(remindAt);
+
+            if (Number.isNaN(when.getTime())) {
+                return res.status(400).json({
+                    error: "remindAt must be a valid date/time",
+                });
+            }
+
+            await pool.query(
+                `
+                INSERT INTO task_reminders
+                    (todo_id, remind_at, message, enabled)
+                VALUES
+                    ($1, $2, $3, TRUE)
+                `,
+                [todoId, when.toISOString(), message?.trim() || null]
+            );
+        } else {
+            // The "days before" method only makes sense relative to a due date.
+            if (!todoResult.rows[0].due_date) {
+                return res.status(400).json({
+                    error:
+                        "This task has no due date — set a custom date & time reminder instead",
+                });
+            }
+
+            const days = parseInt(daysBefore);
+
+            if (Number.isNaN(days) || days < 0) {
+                return res.status(400).json({
+                    error: "daysBefore must be a non-negative number",
+                });
+            }
+
+            await pool.query(
+                `
+                INSERT INTO task_reminders
+                    (todo_id, days_before, message, enabled)
+                VALUES
+                    ($1, $2, $3, TRUE)
+                `,
+                [todoId, days, message?.trim() || null]
+            );
         }
-
-        const days = parseInt(daysBefore);
-
-        if (Number.isNaN(days) || days < 0) {
-            return res.status(400).json({
-                error: "daysBefore must be a non-negative number",
-            });
-        }
-
-        await pool.query(
-            `
-            INSERT INTO task_reminders
-                (todo_id, days_before, message, enabled)
-            VALUES
-                ($1, $2, $3, TRUE)
-            `,
-            [todoId, days, message?.trim() || null]
-        );
 
         const updatedTodo = await getTodoById(todoId, req.user.id);
 
@@ -1935,7 +1978,7 @@ app.patch("/todos/:id/reminders/:reminderId", async (req, res) => {
     try {
         const todoId = parseInt(req.params.id);
         const reminderId = parseInt(req.params.reminderId);
-        const { daysBefore, message, enabled } = req.body;
+        const { daysBefore, remindAt, message, enabled } = req.body;
 
         const result = await pool.query(
             `
@@ -1943,20 +1986,22 @@ app.patch("/todos/:id/reminders/:reminderId", async (req, res) => {
 
             SET
                 days_before = COALESCE($1, r.days_before),
-                message = CASE WHEN $2 IS NOT NULL THEN $2 ELSE r.message END,
-                enabled = COALESCE($3, r.enabled)
+                remind_at = COALESCE($2, r.remind_at),
+                message = CASE WHEN $3 IS NOT NULL THEN $3 ELSE r.message END,
+                enabled = COALESCE($4, r.enabled)
 
             FROM todos t
 
-            WHERE r.id = $4
-            AND r.todo_id = $5
+            WHERE r.id = $5
+            AND r.todo_id = $6
             AND t.id = r.todo_id
-            AND t.user_id = $6
+            AND t.user_id = $7
 
             RETURNING r.id
             `,
             [
                 daysBefore !== undefined ? parseInt(daysBefore) : null,
+                remindAt ? new Date(remindAt).toISOString() : null,
                 message !== undefined ? (message.trim() || null) : null,
                 enabled !== undefined ? enabled : null,
                 reminderId,
